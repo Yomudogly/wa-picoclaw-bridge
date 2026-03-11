@@ -1,0 +1,21 @@
+{
+    "name": "ws-bridge",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "WhatsApp WebSocket Bridge",
+    "main": "index.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "dependencies": {
+        "@fastify/websocket": "^11.2.0",
+        "@whiskeysockets/baileys": "^6.7.21",
+        "dotenv": "^17.3.1",
+        "fastify": "^5.8.2",
+        "pino": "^10.3.1"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
