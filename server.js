@@ -1,8 +1,118 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
-import { makeWASocket, useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import {
+    makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+} from '@whiskeysockets/baileys';
 import pino from 'pino';
+
+const PICO_PREFIX = '[🦞:]';
+const MAX_STORED_MESSAGES = 500;
+const WA_VERSION = [2, 3000, 1033893291];
+const WS_OPEN_STATE = 1;
+const PICO_PREFIX_REGEX = new RegExp(
+    `^${PICO_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`,
+    'i',
+);
+
+function normalizePhoneNumber(value) {
+    return String(value || '').replace(/[^0-9]/g, '');
+}
+
+function extractDigitsFromJid(jid) {
+    const userPart = String(jid || '')
+        .split('@')[0]
+        .split(':')[0];
+    return normalizePhoneNumber(userPart);
+}
+
+function extractSenderPhone(key) {
+    const senderJid = key?.participant || key?.remoteJid || '';
+    return extractDigitsFromJid(senderJid);
+}
+
+function extractMessageText(message) {
+    return message?.conversation || message?.extendedTextMessage?.text || '';
+}
+
+function extractOutboundText(payload) {
+    if (!payload || typeof payload !== 'object') return '';
+
+    const candidates = [
+        payload.content,
+        payload.text,
+        payload.message?.text,
+        payload.message?.content,
+    ];
+
+    for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) {
+            return candidate.trim();
+        }
+    }
+
+    return '';
+}
+
+function hasPicoPrefix(text) {
+    return PICO_PREFIX_REGEX.test(String(text || '').trimStart());
+}
+
+function addSinglePicoPrefix(text) {
+    const trimmed = String(text || '').trim();
+    const withoutPrefix = trimmed.replace(PICO_PREFIX_REGEX, '');
+    return withoutPrefix ? `${PICO_PREFIX} ${withoutPrefix}` : PICO_PREFIX;
+}
+
+function isLidJid(jid) {
+    return String(jid || '').endsWith('@lid');
+}
+
+function toWhatsAppUserJid(phoneNumber) {
+    const digits = normalizePhoneNumber(phoneNumber);
+    return digits ? `${digits}@s.whatsapp.net` : '';
+}
+
+function buildTargetCandidates(parsedMessage, waBotPhoneNumber) {
+    const candidates = [];
+    const seen = new Set();
+
+    const addCandidate = (value) => {
+        const candidate = String(value || '').trim();
+        if (!candidate || seen.has(candidate)) return;
+        seen.add(candidate);
+        candidates.push(candidate);
+    };
+
+    const chatJid = parsedMessage?.chat;
+    const toJid = parsedMessage?.to;
+    const jidJid = parsedMessage?.jid;
+    const fromJid = parsedMessage?.from;
+    const lidCandidate = [chatJid, toJid, jidJid, fromJid].find((jid) =>
+        isLidJid(jid),
+    );
+    const botPnJid = toWhatsAppUserJid(waBotPhoneNumber);
+
+    // Keep strict routing order for same-session behavior.
+    addCandidate(chatJid);
+    addCandidate(toJid);
+    addCandidate(jidJid);
+    addCandidate(fromJid);
+
+    // For LID sessions, include plain PN fallback after chat-based targets.
+    if (lidCandidate) {
+        addCandidate(botPnJid);
+    }
+
+    // Absolute fallback only when upstream omitted all route fields.
+    if (!candidates.length) {
+        addCandidate(botPnJid);
+    }
+
+    return candidates;
+}
 
 function parseIntegerEnv(name, defaultValue) {
     const rawValue = process.env[name];
@@ -18,7 +128,7 @@ function parseIntegerEnv(name, defaultValue) {
 
 function getConfig() {
     const phoneNumberRaw = process.env.WA_BOT_PHONE_NUMBER?.trim() || '';
-    const phoneNumber = phoneNumberRaw.replace(/[^0-9]/g, '');
+    const phoneNumber = normalizePhoneNumber(phoneNumberRaw);
 
     if (!phoneNumber) {
         throw new Error(
@@ -49,6 +159,130 @@ await fastify.register(fastifyWebsocket);
 let sock;
 const activeClients = new Set();
 let isPairingInProgress = false;
+const sentMessageStore = new Map();
+const sentMessageOrder = [];
+
+function rememberMessageById(messageId, messageContent) {
+    if (!messageId || !messageContent) return;
+
+    if (!sentMessageStore.has(messageId)) {
+        sentMessageOrder.push(messageId);
+    }
+    sentMessageStore.set(messageId, messageContent);
+
+    while (sentMessageOrder.length > MAX_STORED_MESSAGES) {
+        const oldestId = sentMessageOrder.shift();
+        if (oldestId) {
+            sentMessageStore.delete(oldestId);
+        }
+    }
+}
+
+async function sendTextMessage(targetJid, text) {
+    if (!sock) {
+        throw new Error('WhatsApp socket is not connected');
+    }
+    const sent = await sock.sendMessage(targetJid, { text });
+    rememberMessageById(sent?.key?.id, sent?.message);
+    return sent;
+}
+
+function removePicoclawClient(socket, reason, err) {
+    activeClients.delete(socket);
+    if (reason === 'error') {
+        fastify.log.warn(
+            { err, activeClients: activeClients.size },
+            'Picoclaw websocket client error',
+        );
+        return;
+    }
+
+    fastify.log.info(
+        { activeClients: activeClients.size },
+        'Picoclaw websocket client disconnected',
+    );
+}
+
+function broadcastToPicoclaw(payload) {
+    if (!activeClients.size) {
+        fastify.log.warn(
+            'No active Picoclaw websocket clients to receive inbound message',
+        );
+        return;
+    }
+
+    for (const client of activeClients) {
+        if (client.readyState === WS_OPEN_STATE) {
+            client.send(payload);
+        }
+    }
+}
+
+async function handleOutboundMessage(parsedMessage) {
+    const normalizedContent = extractOutboundText(parsedMessage);
+    if (!normalizedContent) {
+        fastify.log.warn(
+            { parsedMessage },
+            'Skipping outbound message: missing text content',
+        );
+        return;
+    }
+
+    if (!sock) {
+        fastify.log.warn(
+            'Skipping outbound message: WhatsApp socket not ready',
+        );
+        return;
+    }
+
+    const targetCandidates = buildTargetCandidates(
+        parsedMessage,
+        config.waBotPhoneNumber,
+    );
+    if (!targetCandidates.length) {
+        fastify.log.warn(
+            { parsedMessage },
+            'Skipping outbound message: missing target JID',
+        );
+        return;
+    }
+
+    const outboundText = addSinglePicoPrefix(normalizedContent);
+    fastify.log.info(
+        {
+            targetCandidates,
+            outboundLength: outboundText.length,
+        },
+        'Attempting outbound WhatsApp send',
+    );
+
+    let lastError;
+    let sentTargetJid = '';
+
+    for (const candidate of targetCandidates) {
+        try {
+            await sendTextMessage(candidate, outboundText);
+            sentTargetJid = candidate;
+            break;
+        } catch (err) {
+            lastError = err;
+            fastify.log.warn(
+                { candidate, err },
+                'Outbound WhatsApp send failed for candidate JID',
+            );
+        }
+    }
+
+    if (!sentTargetJid) {
+        fastify.log.error(
+            { targetCandidates, err: lastError },
+            'Outbound WhatsApp send failed for all target JIDs',
+        );
+        return;
+    }
+
+    fastify.log.info({ sentTargetJid }, 'Outbound WhatsApp send succeeded');
+}
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
@@ -57,16 +291,19 @@ async function connectToWhatsApp() {
         auth: state,
         logger: pino({ level: config.waLogLevel }),
         printQRInTerminal: false,
-        version: [2, 3000, 1033893291],
-        // Bypass crypto rejection on MacOS/Docker
+        version: WA_VERSION,
+        // Keep a known-good desktop fingerprint for this environment.
         browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        getMessage: async (key) => sentMessageStore.get(key?.id),
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     if (!state.creds.registered && !isPairingInProgress) {
         isPairingInProgress = true;
-        console.log(`\n⏳ Delaying ${config.pairingDelayMs}ms for socket stabilization...`);
+        console.log(
+            `\n⏳ Delaying ${config.pairingDelayMs}ms for socket stabilization...`,
+        );
 
         setTimeout(async () => {
             try {
@@ -99,7 +336,9 @@ async function connectToWhatsApp() {
                 );
                 setTimeout(connectToWhatsApp, config.pairingDelayMs);
             } else {
-                console.log('❌ Logged out. Delete the whatsapp-auth folder and restart.');
+                console.log(
+                    '❌ Logged out. Delete the whatsapp-auth folder and restart.',
+                );
                 isPairingInProgress = false;
             }
         } else if (connection === 'open') {
@@ -109,21 +348,43 @@ async function connectToWhatsApp() {
     });
 
     // INBOUND: WhatsApp -> Fastify -> Picoclaw
-    sock.ev.on('messages.upsert', async (m) => {
-        // Log raw event for debugging JID formats in the terminal
-        console.log('\n--- RAW BAILEYS EVENT ---');
-        console.log(JSON.stringify(m, null, 2));
-        console.log('-------------------------\n');
+    sock.ev.on('messages.upsert', (m) => {
+        for (const msg of m.messages || []) {
+            rememberMessageById(msg?.key?.id, msg?.message);
+        }
 
         if (m.type !== 'notify') return;
 
         for (const msg of m.messages) {
             if (!msg.message) continue;
 
-            // Safely extract text from standard or extended message types
-            const content = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-
+            const content = extractMessageText(msg.message);
             if (!content) continue;
+            if (!msg.key?.remoteJid) continue;
+
+            const senderPhone = extractSenderPhone(msg.key);
+            const isAllowedSender =
+                msg.key.fromMe || senderPhone === config.waBotPhoneNumber;
+            if (!isAllowedSender) {
+                fastify.log.debug(
+                    {
+                        senderPhone,
+                        allowed: config.waBotPhoneNumber,
+                        fromMe: msg.key.fromMe,
+                        chat: msg.key.remoteJid,
+                    },
+                    'Ignoring inbound message from non-allowed sender',
+                );
+                continue;
+            }
+
+            if (hasPicoPrefix(content)) {
+                fastify.log.debug(
+                    { senderPhone, chat: msg.key.remoteJid, content },
+                    'Ignoring inbound [🦞:] -prefixed message to prevent loops',
+                );
+                continue;
+            }
 
             const picoclawPayload = {
                 type: 'message',
@@ -135,38 +396,35 @@ async function connectToWhatsApp() {
             };
 
             const payloadStr = JSON.stringify(picoclawPayload);
-            console.log('➡️ SENDING TO PICOCLAW:', payloadStr);
-
-            for (const client of activeClients) {
-                if (client.readyState === 1) client.send(payloadStr);
-            }
+            fastify.log.info(
+                { chat: picoclawPayload.chat, id: picoclawPayload.id },
+                'Forwarding inbound message to Picoclaw',
+            );
+            broadcastToPicoclaw(payloadStr);
         }
     });
 }
 
 // OUTBOUND: Picoclaw -> Fastify -> WhatsApp
-fastify.get('/', { websocket: true }, (socket, req) => {
+fastify.get('/', { websocket: true }, (socket) => {
     activeClients.add(socket);
-    socket.on('close', () => activeClients.delete(socket));
+    fastify.log.info(
+        { activeClients: activeClients.size },
+        'Picoclaw websocket client connected',
+    );
+
+    socket.on('close', () => removePicoclawClient(socket, 'close'));
+    socket.on('error', (err) => removePicoclawClient(socket, 'error', err));
 
     socket.on('message', async (message) => {
         try {
             const parsedMessage = JSON.parse(message.toString());
-            fastify.log.info('⬅️ RECEIVED FROM PICOCLAW:', parsedMessage);
-
-            if (parsedMessage.type === 'message' && sock) {
-                // Ensure target JID uses 'to' or falls back to 'chat'
-                const targetJid = parsedMessage.to || parsedMessage.chat;
-                if (targetJid) {
-                    await sock.sendMessage(targetJid, {
-                        text: parsedMessage.content,
-                    });
-                } else {
-                    fastify.log.warn('Outbound message missing target JID');
-                }
-            }
+            await handleOutboundMessage(parsedMessage);
         } catch (err) {
-            fastify.log.error('Failed to route outbound message', err);
+            fastify.log.error(
+                { err, raw: String(message || '') },
+                'Failed to route outbound message',
+            );
         }
     });
 });
