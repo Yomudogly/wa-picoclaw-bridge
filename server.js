@@ -9,11 +9,16 @@ import {
 import pino from 'pino';
 
 const PICO_PREFIX = '[🦞:]';
+const ME_PREFIX = '!!';
 const MAX_STORED_MESSAGES = 500;
 const WA_VERSION = [2, 3000, 1033893291];
 const WS_OPEN_STATE = 1;
 const PICO_PREFIX_REGEX = new RegExp(
     `^${PICO_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`,
+    'i',
+);
+const ME_PREFIX_REGEX = new RegExp(
+    `^${ME_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`,
     'i',
 );
 
@@ -58,6 +63,10 @@ function extractOutboundText(payload) {
 
 function hasPicoPrefix(text) {
     return PICO_PREFIX_REGEX.test(String(text || '').trimStart());
+}
+
+function hasMePrefix(text) {
+    return ME_PREFIX_REGEX.test(String(text || '').trimStart());
 }
 
 function addSinglePicoPrefix(text) {
@@ -126,6 +135,18 @@ function parseIntegerEnv(name, defaultValue) {
     return parsed;
 }
 
+function parseNonNegativeIntegerEnv(name, defaultValue) {
+    const rawValue = process.env[name];
+    if (!rawValue) return defaultValue;
+
+    const parsed = Number.parseInt(rawValue, 10);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+        throw new Error(`${name} must be a non-negative integer. Received: "${rawValue}"`);
+    }
+
+    return parsed;
+}
+
 function getConfig() {
     const phoneNumberRaw = process.env.WA_BOT_PHONE_NUMBER?.trim() || '';
     const phoneNumber = normalizePhoneNumber(phoneNumberRaw);
@@ -147,6 +168,7 @@ function getConfig() {
         port: parseIntegerEnv('PORT', 3001),
         authDir: process.env.WA_AUTH_DIR || './whatsapp-auth',
         pairingDelayMs: parseIntegerEnv('PAIRING_DELAY_MS', 5000),
+        inboundHistoryGraceMs: parseNonNegativeIntegerEnv('INBOUND_HISTORY_GRACE_MS', 30000),
         waLogLevel: process.env.WA_LOG_LEVEL || 'silent',
         waBotPhoneNumber: phoneNumber,
     };
@@ -161,6 +183,58 @@ const activeClients = new Set();
 let isPairingInProgress = false;
 const sentMessageStore = new Map();
 const sentMessageOrder = [];
+let inboundForwardReadyAtMs = Date.now() + config.inboundHistoryGraceMs;
+const seenInboundMessageIds = new Set();
+const seenInboundMessageOrder = [];
+const MAX_SEEN_INBOUND_IDS = 2000;
+let outboundArmed = false;
+
+function rememberInboundMessageId(messageId) {
+    if (!messageId || seenInboundMessageIds.has(messageId)) return;
+    seenInboundMessageIds.add(messageId);
+    seenInboundMessageOrder.push(messageId);
+
+    while (seenInboundMessageOrder.length > MAX_SEEN_INBOUND_IDS) {
+        const oldestId = seenInboundMessageOrder.shift();
+        if (oldestId) {
+            seenInboundMessageIds.delete(oldestId);
+        }
+    }
+}
+
+function isAlreadyProcessedInboundMessage(messageId) {
+    return Boolean(messageId) && seenInboundMessageIds.has(messageId);
+}
+
+function extractMessageTimestampMs(timestampValue) {
+    if (!timestampValue) return 0;
+
+    if (typeof timestampValue === 'number' && Number.isFinite(timestampValue)) {
+        return timestampValue > 1_000_000_000_000
+            ? Math.trunc(timestampValue)
+            : Math.trunc(timestampValue * 1000);
+    }
+
+    if (typeof timestampValue === 'string') {
+        const asNumber = Number(timestampValue);
+        if (Number.isFinite(asNumber)) {
+            return asNumber > 1_000_000_000_000
+                ? Math.trunc(asNumber)
+                : Math.trunc(asNumber * 1000);
+        }
+    }
+
+    if (typeof timestampValue?.toNumber === 'function') {
+        const asNumber = timestampValue.toNumber();
+        if (Number.isFinite(asNumber)) {
+            return asNumber > 1_000_000_000_000
+                ? Math.trunc(asNumber)
+                : Math.trunc(asNumber * 1000);
+        }
+    }
+
+    return 0;
+}
 
 function rememberMessageById(messageId, messageContent) {
     if (!messageId || !messageContent) return;
@@ -219,6 +293,14 @@ function broadcastToPicoclaw(payload) {
 }
 
 async function handleOutboundMessage(parsedMessage) {
+    if (!outboundArmed) {
+        fastify.log.info(
+            { parsedMessage },
+            'Skipping outbound message: bridge is not armed yet (waiting for fresh inbound message)',
+        );
+        return;
+    }
+
     const normalizedContent = extractOutboundText(parsedMessage);
     if (!normalizedContent) {
         fastify.log.warn(
@@ -343,7 +425,17 @@ async function connectToWhatsApp() {
             }
         } else if (connection === 'open') {
             isPairingInProgress = false;
+            inboundForwardReadyAtMs = Date.now() + config.inboundHistoryGraceMs;
+            outboundArmed = false;
             console.log('✅ Baileys Meta socket connected successfully.');
+            fastify.log.info(
+                {
+                    inboundForwardReadyAtMs,
+                    inboundHistoryGraceMs: config.inboundHistoryGraceMs,
+                    outboundArmed,
+                },
+                'Inbound forwarding backlog guard reset',
+            );
         }
     });
 
@@ -357,6 +449,39 @@ async function connectToWhatsApp() {
 
         for (const msg of m.messages) {
             if (!msg.message) continue;
+            if (!msg.key?.id) continue;
+
+            if (isAlreadyProcessedInboundMessage(msg.key.id)) {
+                continue;
+            }
+            rememberInboundMessageId(msg.key.id);
+
+            const messageTimestampMs = extractMessageTimestampMs(msg.messageTimestamp);
+            if (messageTimestampMs && messageTimestampMs < inboundForwardReadyAtMs) {
+                fastify.log.debug(
+                    {
+                        id: msg.key.id,
+                        messageTimestampMs,
+                        inboundForwardReadyAtMs,
+                        chat: msg.key?.remoteJid,
+                    },
+                    'Skipping historical inbound message during startup guard window',
+                );
+                continue;
+            }
+
+            if (Date.now() < inboundForwardReadyAtMs) {
+                fastify.log.debug(
+                    {
+                        id: msg.key.id,
+                        nowMs: Date.now(),
+                        inboundForwardReadyAtMs,
+                        chat: msg.key?.remoteJid,
+                    },
+                    'Skipping inbound message while startup guard window is still active',
+                );
+                continue;
+            }
 
             const content = extractMessageText(msg.message);
             if (!content) continue;
@@ -374,6 +499,14 @@ async function connectToWhatsApp() {
                         chat: msg.key.remoteJid,
                     },
                     'Ignoring inbound message from non-allowed sender',
+                );
+                continue;
+            }
+
+            if (!hasMePrefix(content)) {
+                fastify.log.debug(
+                    { senderPhone, chat: msg.key.remoteJid, content },
+                    'Ignoring inbound !! - prefixed message to prevent PicoClaw responses from non-addressed messages',
                 );
                 continue;
             }
@@ -396,8 +529,13 @@ async function connectToWhatsApp() {
             };
 
             const payloadStr = JSON.stringify(picoclawPayload);
+            outboundArmed = true;
             fastify.log.info(
-                { chat: picoclawPayload.chat, id: picoclawPayload.id },
+                {
+                    chat: picoclawPayload.chat,
+                    id: picoclawPayload.id,
+                    outboundArmed,
+                },
                 'Forwarding inbound message to Picoclaw',
             );
             broadcastToPicoclaw(payloadStr);
