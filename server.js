@@ -519,11 +519,14 @@ async function connectToWhatsApp() {
                 continue;
             }
 
+            const contentWithoutPrefix = content
+                .replace(ME_PREFIX_REGEX, '')
+                .trim();
             const picoclawPayload = {
                 type: 'message',
                 from: msg.key.participant || msg.key.remoteJid,
                 chat: msg.key.remoteJid,
-                content,
+                content: contentWithoutPrefix,
                 id: msg.key.id,
                 from_name: msg.pushName || 'User',
             };

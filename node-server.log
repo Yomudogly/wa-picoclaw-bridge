@@ -1,0 +1,7 @@
+{"level":30,"time":1773846233800,"pid":70375,"hostname":"Marinemax-Roman-MacBook-Pro.local","msg":"Server listening at http://127.0.0.1:3324"}
+🚀 Fastify WebSocket Bridge running on ws://127.0.0.1:3324
+✅ Baileys Meta socket connected successfully.
+{"level":30,"time":1773846234551,"pid":70375,"hostname":"Marinemax-Roman-MacBook-Pro.local","inboundForwardReadyAtMs":1773846264551,"inboundHistoryGraceMs":30000,"outboundArmed":false,"msg":"Inbound forwarding backlog guard reset"}
+{"level":30,"time":1773846237515,"pid":70375,"hostname":"Marinemax-Roman-MacBook-Pro.local","reqId":"req-1","req":{"method":"GET","url":"/","host":"localhost:3324","remoteAddress":"127.0.0.1","remotePort":54398},"msg":"incoming request"}
+{"level":30,"time":1773846237518,"pid":70375,"hostname":"Marinemax-Roman-MacBook-Pro.local","activeClients":1,"msg":"Picoclaw websocket client connected"}
+{"level":30,"time":1773846263133,"pid":70375,"hostname":"Marinemax-Roman-MacBook-Pro.local","activeClients":0,"msg":"Picoclaw websocket client disconnected"}
