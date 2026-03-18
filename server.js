@@ -522,6 +522,7 @@ async function connectToWhatsApp() {
             const contentWithoutPrefix = content
                 .replace(ME_PREFIX_REGEX, '')
                 .trim();
+                
             const picoclawPayload = {
                 type: 'message',
                 from: msg.key.participant || msg.key.remoteJid,
